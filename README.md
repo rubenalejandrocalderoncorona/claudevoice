@@ -1,5 +1,7 @@
 # claudevoice
 
+![Version](https://img.shields.io/badge/version-v0.0.1-blue)
+
 Voice interaction and voice-based tool approval for [Claude Code](https://claude.ai/code) on macOS.
 
 This repo documents how to set up:
@@ -19,9 +21,19 @@ This repo documents how to set up:
   - [Phase 2 — Install Local Voice Services](#phase-2--install-local-voice-services)
   - [Phase 3 — Grant Permissions](#phase-3--grant-permissions)
   - [Phase 4 — Voice Confirmation Hook](#phase-4--voice-confirmation-hook)
+- [Known Issues](#known-issues)
 - [Reverting / Disabling](#reverting--disabling)
 - [Configuration Reference](#configuration-reference)
 - [Troubleshooting](#troubleshooting)
+
+## Changelog
+
+### v0.0.1
+- Initial release
+- VoiceMode plugin setup guide (converse, service management)
+- Voice confirmation hook for tool approval prompts
+- Automated install/uninstall scripts
+- Fix: disable audio feedback chimes that trigger on every Claude Code request
 
 ---
 
@@ -270,6 +282,37 @@ If no clear response is detected, it retries up to 3 times. After all retries ar
   }
 }
 ```
+
+---
+
+## Known Issues
+
+### Audio beeps / chimes on every Claude Code request
+
+**Symptom:** macOS plays short beep or chime sounds whenever Claude Code makes a request, even outside of voice conversations.
+
+**Cause:** VoiceMode enables audio feedback chimes and soundfont hooks by default (`VOICEMODE_AUDIO_FEEDBACK=true`, `VOICEMODE_SOUNDFONTS_ENABLED=true`). These trigger on tool use events, not just during voice sessions.
+
+**Fix:** Disable both settings in `~/.voicemode/voicemode.env`:
+
+```bash
+# Find and uncomment/set these two lines:
+VOICEMODE_AUDIO_FEEDBACK=false
+VOICEMODE_SOUNDFONTS_ENABLED=false
+```
+
+Or run this one-liner:
+
+```bash
+sed -i '' \
+  's/^# VOICEMODE_AUDIO_FEEDBACK=true/VOICEMODE_AUDIO_FEEDBACK=false/' \
+  ~/.voicemode/voicemode.env
+sed -i '' \
+  's/^# VOICEMODE_SOUNDFONTS_ENABLED=true/VOICEMODE_SOUNDFONTS_ENABLED=false/' \
+  ~/.voicemode/voicemode.env
+```
+
+No restart required — the env file is read at runtime.
 
 ---
 

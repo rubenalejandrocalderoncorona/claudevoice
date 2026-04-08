@@ -1,5 +1,7 @@
 # claudevoice — Quick Start
 
+![Version](https://img.shields.io/badge/version-v0.0.1-blue)
+
 Get voice interaction + voice-based tool approvals working in Claude Code in under 5 minutes.
 
 ## Prerequisites
@@ -86,3 +88,16 @@ cp scripts/voice-confirm.py ~/.claude/voice-confirm.py
 ```bash
 bash scripts/uninstall.sh
 ```
+
+---
+
+## Known issue: audio beeps
+
+If your Mac beeps on every Claude Code request, disable VoiceMode chimes:
+
+```bash
+sed -i '' 's/^# VOICEMODE_AUDIO_FEEDBACK=true/VOICEMODE_AUDIO_FEEDBACK=false/' ~/.voicemode/voicemode.env
+sed -i '' 's/^# VOICEMODE_SOUNDFONTS_ENABLED=true/VOICEMODE_SOUNDFONTS_ENABLED=false/' ~/.voicemode/voicemode.env
+```
+
+See [README.md — Known Issues](./README.md#known-issues) for details.
