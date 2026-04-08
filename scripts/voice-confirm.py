@@ -16,6 +16,7 @@ import sys
 import tempfile
 import urllib.request
 import urllib.error
+from typing import Optional
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 TTS_URL = os.environ.get("VOICEMODE_TTS_URL", "http://127.0.0.1:8880/v1/audio/speech")
@@ -60,7 +61,7 @@ def tts_speak(text: str) -> bool:
         return False
 
 
-def record_audio(duration: int) -> str | None:
+def record_audio(duration: int) -> Optional[str]:
     """Record audio for `duration` seconds. Returns path to wav file or None."""
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         out_path = f.name
@@ -85,7 +86,7 @@ def record_audio(duration: int) -> str | None:
         return None
 
 
-def stt_transcribe(audio_path: str) -> str | None:
+def stt_transcribe(audio_path: str) -> Optional[str]:
     """Send audio to Whisper STT. Returns transcription text or None."""
     try:
         with open(audio_path, "rb") as f:
@@ -126,6 +127,18 @@ def check_service(url: str) -> bool:
         return False
 
 
+GIT_PREFIXES = ("git ", "git\t")
+READ_ONLY_CMDS = ("git ", "gh ", "cat ", "head ", "tail ", "ls ", "echo ",
+                  "grep ", "find ", "curl -s", "curl -f", "python3 -c \"import ast",
+                  "jq ", "wc ", "sort ", "diff ", "which ", "type ")
+
+
+def is_safe_readonly(command: str) -> bool:
+    """Returns True for commands that should auto-approve without voice."""
+    cmd = command.strip()
+    return any(cmd.startswith(p) for p in READ_ONLY_CMDS)
+
+
 def keyboard_confirm(prompt: str) -> bool:
     """Fallback: ask via keyboard on /dev/tty."""
     try:
@@ -154,7 +167,7 @@ def build_prompt(payload: dict) -> str:
     return f"{tool} wants to run: {cmd}. Do you approve?"
 
 
-def decide(transcript: str) -> str | None:
+def decide(transcript: str) -> Optional[str]:
     """Returns 'allow', 'deny', or None (unclear)."""
     words = set(transcript.lower().replace(",", " ").replace(".", " ").split())
     if words & YES_KEYWORDS:
@@ -189,6 +202,15 @@ def main():
         sys.exit(0)
 
     prompt_text = build_prompt(payload)
+
+    # Auto-approve safe read-only commands without voice
+    tool_input = payload.get("tool_input", {})
+    if isinstance(tool_input, dict):
+        cmd = tool_input.get("command", "")
+        if is_safe_readonly(cmd):
+            respond("allow")
+            return
+
     tts_ok = check_service(TTS_URL)
     stt_ok = check_service(STT_URL)
 
