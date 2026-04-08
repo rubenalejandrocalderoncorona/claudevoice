@@ -2,7 +2,8 @@
 """
 voice-confirm.py — Claude Code PermissionRequest hook
 Intercepts tool approval prompts and handles them via voice (TTS + STT).
-Retries up to MAX_RETRIES times before falling back to keyboard input.
+TTS and recording run concurrently to minimize latency.
+Retries up to MAX_RETRIES times before falling back to auto-deny.
 
 Services expected:
   Kokoro TTS: http://127.0.0.1:8880/v1/audio/speech
@@ -14,6 +15,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.request
 import urllib.error
 from typing import Optional
@@ -21,8 +23,8 @@ from typing import Optional
 # ── Configuration ─────────────────────────────────────────────────────────────
 TTS_URL = os.environ.get("VOICEMODE_TTS_URL", "http://127.0.0.1:8880/v1/audio/speech")
 STT_URL = os.environ.get("VOICEMODE_STT_URL", "http://127.0.0.1:2022/v1/audio/transcriptions")
-RECORD_SECONDS = int(os.environ.get("VOICE_CONFIRM_RECORD_SECS", "5"))
-MAX_RETRIES = int(os.environ.get("VOICE_CONFIRM_MAX_RETRIES", "3"))
+RECORD_SECONDS = int(os.environ.get("VOICE_CONFIRM_RECORD_SECS", "6"))
+MAX_RETRIES = int(os.environ.get("VOICE_CONFIRM_MAX_RETRIES", "2"))
 FFMPEG = os.environ.get("FFMPEG_PATH", "/opt/homebrew/bin/ffmpeg")
 AFPLAY = "/usr/bin/afplay"
 
@@ -34,8 +36,8 @@ NO_KEYWORDS  = {"no", "nope", "nah", "deny", "denied", "cancel", "stop",
                 "block", "refuse", "refused"}
 
 
-def tts_speak(text: str) -> bool:
-    """Synthesize text and play it. Returns True on success."""
+def tts_fetch(text: str) -> Optional[bytes]:
+    """Fetch TTS audio bytes from Kokoro. Returns None on failure."""
     payload = json.dumps({
         "model": "kokoro",
         "input": text,
@@ -50,15 +52,20 @@ def tts_speak(text: str) -> bool:
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            audio_data = resp.read()
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-            f.write(audio_data)
-            tmp_path = f.name
-        subprocess.run([AFPLAY, tmp_path], check=True, capture_output=True)
-        os.unlink(tmp_path)
-        return True
+            return resp.read()
     except Exception:
-        return False
+        return None
+
+
+def tts_play(audio_bytes: bytes):
+    """Play audio bytes via afplay (blocking)."""
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+        f.write(audio_bytes)
+        tmp_path = f.name
+    try:
+        subprocess.run([AFPLAY, tmp_path], check=True, capture_output=True)
+    finally:
+        os.unlink(tmp_path)
 
 
 def record_audio(duration: int) -> Optional[str]:
@@ -118,37 +125,26 @@ def stt_transcribe(audio_path: str) -> Optional[str]:
 
 
 def check_service(url: str) -> bool:
-    """Quick health-check: returns True if the service root responds."""
+    """Quick health-check: returns True if the service root responds (any HTTP status)."""
     base = url.rsplit("/v1/", 1)[0] + "/"
     try:
         urllib.request.urlopen(base, timeout=2)
         return True
+    except urllib.error.HTTPError:
+        return True  # Got a response — service is up, path just doesn't exist
     except Exception:
         return False
 
 
-GIT_PREFIXES = ("git ", "git\t")
 READ_ONLY_CMDS = ("git ", "gh ", "cat ", "head ", "tail ", "ls ", "echo ",
-                  "grep ", "find ", "curl -s", "curl -f", "python3 -c \"import ast",
-                  "jq ", "wc ", "sort ", "diff ", "which ", "type ")
+                  "grep ", "find ", "curl -s", "curl -f",
+                  "python3 -c \"import ast", "jq ", "wc ", "sort ",
+                  "diff ", "which ", "type ")
 
 
 def is_safe_readonly(command: str) -> bool:
-    """Returns True for commands that should auto-approve without voice."""
     cmd = command.strip()
     return any(cmd.startswith(p) for p in READ_ONLY_CMDS)
-
-
-def keyboard_confirm(prompt: str) -> bool:
-    """Fallback: ask via keyboard on /dev/tty."""
-    try:
-        with open("/dev/tty", "r") as tty:
-            sys.stderr.write(f"\n[voice-confirm] {prompt} [y/N]: ")
-            sys.stderr.flush()
-            answer = tty.readline().strip().lower()
-        return answer in {"y", "yes"}
-    except Exception:
-        return False
 
 
 def build_prompt(payload: dict) -> str:
@@ -158,13 +154,12 @@ def build_prompt(payload: dict) -> str:
     if isinstance(tool_input, dict):
         cmd = tool_input.get("command") or tool_input.get("description") or ""
         if not cmd:
-            # Generic: join first two values
             cmd = " ".join(str(v) for v in list(tool_input.values())[:2])
     else:
         cmd = str(tool_input)
 
-    cmd = cmd[:200]  # cap length for TTS
-    return f"{tool} wants to run: {cmd}. Do you approve?"
+    cmd = cmd[:200]
+    return f"{tool} wants to run: {cmd}. Say yes or no."
 
 
 def decide(transcript: str) -> Optional[str]:
@@ -174,7 +169,6 @@ def decide(transcript: str) -> Optional[str]:
         return "allow"
     if words & NO_KEYWORDS:
         return "deny"
-    # Single-word check for partial matches
     for w in words:
         if any(kw in w for kw in YES_KEYWORDS):
             return "allow"
@@ -191,6 +185,49 @@ def respond(behavior: str):
         }
     }
     print(json.dumps(out))
+    sys.stdout.flush()
+
+
+def keyboard_confirm(prompt_text: str):
+    """Fall back to keyboard input on /dev/tty when voice fails."""
+    try:
+        with open("/dev/tty", "r") as tty:
+            sys.stderr.write(f"\nVoice recognition failed. {prompt_text}\nApprove? [y/N]: ")
+            sys.stderr.flush()
+            answer = tty.readline().strip().lower()
+        if answer in {"y", "yes"}:
+            respond("allow")
+        else:
+            respond("deny")
+    except Exception:
+        respond("deny")
+
+
+def speak_and_record(prompt_text: str) -> Optional[str]:
+    """
+    Fetch TTS audio, then play it and record simultaneously so the user
+    can start speaking while audio is still playing. Returns wav path or None.
+    """
+    audio_bytes = tts_fetch(prompt_text)
+
+    # Start recording immediately (overlap with TTS playback)
+    record_result: list[Optional[str]] = [None]
+    record_done = threading.Event()
+
+    def do_record():
+        record_result[0] = record_audio(RECORD_SECONDS)
+        record_done.set()
+
+    record_thread = threading.Thread(target=do_record, daemon=True)
+    record_thread.start()
+
+    # Play TTS if we got audio
+    if audio_bytes:
+        tts_play(audio_bytes)
+
+    # Wait for recording to finish
+    record_done.wait(timeout=RECORD_SECONDS + 6)
+    return record_result[0]
 
 
 def main():
@@ -198,12 +235,11 @@ def main():
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
-        # Pass-through: can't parse, let Claude Code handle normally
         sys.exit(0)
 
     prompt_text = build_prompt(payload)
 
-    # Auto-approve safe read-only commands without voice
+    # Auto-approve safe read-only commands
     tool_input = payload.get("tool_input", {})
     if isinstance(tool_input, dict):
         cmd = tool_input.get("command", "")
@@ -215,17 +251,14 @@ def main():
     stt_ok = check_service(STT_URL)
 
     if not tts_ok or not stt_ok:
-        # Services down — keyboard fallback
-        approved = keyboard_confirm(prompt_text)
-        respond("allow" if approved else "deny")
+        # Services down — deny to avoid silent auto-approval
+        respond("deny")
         return
 
     for attempt in range(1, MAX_RETRIES + 1):
         retry_prefix = f"Attempt {attempt} of {MAX_RETRIES}. " if attempt > 1 else ""
-        spoken = retry_prefix + prompt_text
-        tts_speak(spoken)
+        audio_path = speak_and_record(retry_prefix + prompt_text)
 
-        audio_path = record_audio(RECORD_SECONDS)
         if audio_path:
             transcript = stt_transcribe(audio_path)
             os.unlink(audio_path)
@@ -235,19 +268,24 @@ def main():
         if transcript:
             decision = decide(transcript)
             if decision:
-                # Confirm what we heard
-                tts_speak(f"Heard: {transcript}. {'Approved.' if decision == 'allow' else 'Denied.'}")
+                confirm_text = f"{'Approved.' if decision == 'allow' else 'Denied.'}"
+                # Speak confirmation in background — don't block the response
+                conf_bytes = tts_fetch(confirm_text)
+                if conf_bytes:
+                    threading.Thread(
+                        target=tts_play, args=(conf_bytes,), daemon=True
+                    ).start()
                 respond(decision)
                 return
 
-        # Unclear — retry
         if attempt < MAX_RETRIES:
-            tts_speak("Sorry, I didn't catch that. Please say yes or no.")
+            # Speak retry prompt (blocking so user knows to try again)
+            retry_audio = tts_fetch("Sorry, I didn't catch that. Please say yes or no.")
+            if retry_audio:
+                tts_play(retry_audio)
 
-    # All retries exhausted — keyboard fallback
-    tts_speak("Falling back to keyboard input.")
-    approved = keyboard_confirm(prompt_text)
-    respond("allow" if approved else "deny")
+    # All retries exhausted — fall back to keyboard
+    keyboard_confirm(prompt_text)
 
 
 if __name__ == "__main__":
